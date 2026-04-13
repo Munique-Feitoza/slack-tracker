@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+
+.env
+.env.*
+!.env.example
+
+*.db
+*.sqlite
+*.sqlite3
+
+.DS_Store
+*.swp
+*.swo
