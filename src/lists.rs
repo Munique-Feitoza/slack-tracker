@@ -55,6 +55,78 @@ fn extract_field<'a>(item: &'a Value, key: &str) -> Option<&'a Value> {
         .find(|f| f.get("key").and_then(|v| v.as_str()) == Some(key))
 }
 
+pub async fn fetch_first_item_raw(token: &str, list_id: &str) -> Result<String, String> {
+    let client = http_client()?;
+    let body: Value = client
+        .post(format!("{}/slackLists.items.list", SLACK_BASE))
+        .bearer_auth(token)
+        .form(&[("list_id", list_id)])
+        .send()
+        .await
+        .map_err(|e| format!("request falhou: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("json inválido: {}", e))?;
+    check_ok(&body)?;
+
+    let first = body
+        .get("items")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .ok_or("lista vazia")?;
+
+    Ok(serde_json::to_string_pretty(first).unwrap_or_else(|_| first.to_string()))
+}
+
+pub async fn fetch_raw_fields(token: &str, list_id: &str) -> Result<Vec<(String, String)>, String> {
+    let client = http_client()?;
+    let body: Value = client
+        .post(format!("{}/slackLists.items.list", SLACK_BASE))
+        .bearer_auth(token)
+        .form(&[("list_id", list_id)])
+        .send()
+        .await
+        .map_err(|e| format!("request falhou: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("json inválido: {}", e))?;
+    check_ok(&body)?;
+
+    let first = body
+        .get("items")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .ok_or("lista vazia")?;
+
+    let fields = first
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .ok_or("sem campo fields")?;
+
+    let mut result: Vec<(String, String)> = fields.iter().map(|f| {
+        let key = f.get("key").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        let tipo = f.get("type").and_then(|v| v.as_str())
+            .or_else(|| f.get("rich_text").map(|_| "rich_text"))
+            .or_else(|| f.get("text").map(|_| "text"))
+            .or_else(|| f.get("checkbox").map(|_| "checkbox"))
+            .unwrap_or("?").to_string();
+        (key, tipo)
+    }).collect();
+
+    // também expõe campos top-level do item (ex: channel, thread_ts)
+    for (k, v) in first.as_object().unwrap_or(&serde_json::Map::new()) {
+        if k == "fields" { continue; }
+        let display = match v {
+            Value::String(s) => s.clone(),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(n) => n.to_string(),
+            _ => format!("{}", v).chars().take(60).collect(),
+        };
+        result.push((format!("[top] {}", k), display));
+    }
+    Ok(result)
+}
+
 pub async fn fetch_items(token: &str, list_id: &str) -> Result<Vec<ListItem>, String> {
     let client = http_client()?;
     let body: Value = client
@@ -153,6 +225,42 @@ pub async fn create_subtask(
         .send()
         .await
         .map_err(|e| format!("request slackLists.items.create falhou: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("json inválido: {}", e))?;
+    check_ok(&body)?;
+
+    let row_id = body
+        .pointer("/item/id")
+        .or_else(|| body.pointer("/id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(row_id)
+}
+
+pub async fn create_root_item(
+    token: &str,
+    list_id: &str,
+    texto: &str,
+) -> Result<String, String> {
+    let client = http_client()?;
+    let initial_fields = vec![json!({
+        "column_id": col_name(),
+        "rich_text": rich_text_block(texto)
+    })];
+    let payload = json!({
+        "list_id": list_id,
+        "initial_fields": initial_fields
+    });
+
+    let body: Value = client
+        .post(format!("{}/slackLists.items.create", SLACK_BASE))
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("request slackLists.items.create falhou (root): {}", e))?
         .json()
         .await
         .map_err(|e| format!("json inválido: {}", e))?;

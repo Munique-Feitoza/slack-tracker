@@ -57,6 +57,10 @@ static PROJECT_REGEXES: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             Regex::new(r"(?i)(.+?)\s*[-–—]\s*Sublime Text").unwrap(),
             "Sublime",
         ),
+        (
+            Regex::new(r"(?i)(.+?)\s*[-–—]\s*Antigravity").unwrap(),
+            "Antigravity",
+        ),
     ]
 });
 
@@ -217,11 +221,51 @@ enum CliCommand {
 enum TodoAction {
     /// Imprime a lista atual — hierarquia, row_ids, status — pra debug.
     Inspect,
-    /// Coleta atividade de hoje, pede um plano à LLM e (com --apply) aplica na lista.
+    /// Consolida itens de uma semana que excedeu 50 subtarefas (limite Slack).
+    /// Pede pra LLM reescrever a lista agrupando itens relacionados, sem perder informação.
+    Consolidate {
+        /// Data dentro da semana a consolidar (YYYY-MM-DD).
+        #[arg(long = "week")]
+        week: String,
+        /// Aplica as mudanças (deleta antigos + cria consolidados). Sem essa flag, dry-run.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Adiciona itens prontos (um texto por linha lido do stdin) como subtarefas da semana.
+    /// Útil quando os providers LLM estão indisponíveis e os nomes são gerados externamente.
+    Add {
+        /// Data dentro da semana onde inserir os itens (YYYY-MM-DD).
+        #[arg(long = "week")]
+        week: String,
+        /// Data a setar em cada item (YYYY-MM-DD). Padrão: igual a --week.
+        #[arg(long)]
+        date: Option<String>,
+        /// Marca cada item criado como feito.
+        #[arg(long)]
+        done: bool,
+        /// Aplica de fato. Sem essa flag, só imprime o que faria (dry-run).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Coleta atividade de uma data (ou range) e aplica na lista.
     Sync {
         /// Aplica as mudanças na Slack List. Sem essa flag, só imprime o que faria (dry-run).
         #[arg(long)]
         apply: bool,
+        /// Data alvo no formato YYYY-MM-DD (padrão: hoje). Conflita com --from/--to.
+        #[arg(long)]
+        date: Option<String>,
+        /// Início do range (YYYY-MM-DD). Use junto com --to para sincronizar vários dias num único call do LLM.
+        #[arg(long)]
+        from: Option<String>,
+        /// Fim do range (YYYY-MM-DD). Use junto com --from.
+        #[arg(long)]
+        to: Option<String>,
+        /// Data dentro da semana onde os itens devem ser inseridos (padrão: igual à data/`to`).
+        /// Use para retroativos: --from 2026-04-25 --to 2026-04-27 --target-week 2026-04-28
+        /// coloca atividade de sáb-seg dentro do parent da semana atual.
+        #[arg(long = "target-week")]
+        target_week: Option<String>,
     },
 }
 
@@ -286,24 +330,6 @@ fn apply_mode() -> bool {
         .unwrap_or(false)
 }
 
-fn next_fire_at(hour: u32, minute: u32) -> chrono::DateTime<chrono::Local> {
-    let now = chrono::Local::now();
-    let today = now.date_naive();
-    let today_target = today
-        .and_hms_opt(hour, minute, 0)
-        .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
-        .unwrap_or(now);
-    if today_target > now {
-        today_target
-    } else {
-        let tomorrow = today + chrono::Duration::days(1);
-        tomorrow
-            .and_hms_opt(hour, minute, 0)
-            .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
-            .unwrap_or(now)
-    }
-}
-
 async fn daily_sync_loop() {
     let (hour, minute) = parse_target_time();
     let apply = apply_mode();
@@ -312,44 +338,60 @@ async fn daily_sync_loop() {
         hour, minute, apply
     );
 
-    let now = chrono::Local::now();
-    let today = now.date_naive();
-    let today_target_passed = now.time()
-        >= chrono::NaiveTime::from_hms_opt(hour, minute, 0).unwrap_or_default();
-    let already_synced_today = read_last_sync() == Some(today);
-    if today_target_passed && !already_synced_today {
-        info!("catch-up: não rodou hoje e já passou do horário alvo, disparando agora");
-        if let Err(e) = run_todo_sync(apply).await {
-            error!("catch-up sync falhou: {}", e);
-        } else {
-            write_last_sync(today);
-        }
-    }
-
+    // Poll-based: acorda a cada 60s e checa o relógio de parede.
+    // Resistente a suspend/hibernate (CLOCK_MONOTONIC do tokio::sleep não
+    // avança durante suspensão, então sleeps longos disparam tarde).
+    let mut last_failure_at: Option<chrono::DateTime<chrono::Local>> = None;
+    let cooldown = chrono::Duration::minutes(30);
     loop {
-        let next = next_fire_at(hour, minute);
         let now = chrono::Local::now();
-        let delay = (next - now).to_std().unwrap_or(Duration::from_secs(60));
-        info!(
-            "próximo todo sync: {} (em {}min)",
-            next.format("%Y-%m-%d %H:%M:%S"),
-            delay.as_secs() / 60
-        );
-        tokio::time::sleep(delay).await;
-        let fire_date = chrono::Local::now().date_naive();
-        if read_last_sync() == Some(fire_date) {
-            info!("sync diário já rodou hoje, pulando");
-            tokio::time::sleep(Duration::from_secs(120)).await;
-            continue;
-        }
-        match run_todo_sync(apply).await {
-            Ok(_) => {
-                info!("sync diário executado com sucesso");
-                write_last_sync(fire_date);
+        let today = now.date_naive();
+        let target = chrono::NaiveTime::from_hms_opt(hour, minute, 0).unwrap_or_default();
+        let last_sync = read_last_sync();
+        let already_synced_today = last_sync == Some(today);
+        let target_passed_today = now.time() >= target;
+        let in_cooldown = last_failure_at
+            .map(|t| (now - t) < cooldown)
+            .unwrap_or(false);
+
+        if target_passed_today && !already_synced_today && !in_cooldown {
+            // Backfill: se perdemos dias (daemon offline, suspend, etc.),
+            // o range cobre desde last_sync+1 até hoje. Dividimos por semana
+            // pra cada chunk ir pro parent certo (semanas começam na segunda).
+            let from = match last_sync {
+                Some(d) if d < today => d + chrono::Duration::days(1),
+                _ => today,
+            };
+            let chunks = split_range_by_week(from, today);
+            info!(
+                "disparando sync diário: range {} → {} ({} chunk(s) de semana)",
+                from,
+                today,
+                chunks.len()
+            );
+            let mut all_ok = true;
+            for (chunk_from, chunk_to) in chunks {
+                info!("  chunk: {} → {}", chunk_from, chunk_to);
+                match run_todo_sync(apply, chunk_from, chunk_to, chunk_to).await {
+                    Ok(_) => info!("  chunk {} → {} OK", chunk_from, chunk_to),
+                    Err(e) => {
+                        error!("  chunk {} → {} falhou: {}", chunk_from, chunk_to, e);
+                        all_ok = false;
+                        break;
+                    }
+                }
             }
-            Err(e) => error!("sync diário falhou: {}", e),
+            if all_ok {
+                info!("sync diário executado com sucesso");
+                write_last_sync(today);
+                last_failure_at = None;
+            } else {
+                error!("sync diário falhou em algum chunk (próximo retry em 30min)");
+                last_failure_at = Some(now);
+            }
         }
-        tokio::time::sleep(Duration::from_secs(120)).await;
+
+        tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
 
@@ -361,9 +403,9 @@ fn slack_env() -> Result<(String, String), String> {
     Ok((token, list_id))
 }
 
-fn find_current_week_parent(items: &[lists::ListItem]) -> Option<&lists::ListItem> {
+fn find_current_week_parent(items: &[lists::ListItem], date: chrono::NaiveDate) -> Option<&lists::ListItem> {
     let re = regex::Regex::new(r"(\d{2})/(\d{2})/(\d{4})\s*-\s*(\d{2})/(\d{2})/(\d{4})").ok()?;
-    let today = chrono::Local::now().date_naive();
+    let today = date;
     for it in items.iter().filter(|i| i.parent_id.is_none()) {
         let name = match it.name.as_deref() {
             Some(n) => n,
@@ -389,8 +431,53 @@ fn find_current_week_parent(items: &[lists::ListItem]) -> Option<&lists::ListIte
     None
 }
 
+fn get_week_range(date: chrono::NaiveDate) -> (chrono::NaiveDate, chrono::NaiveDate) {
+    use chrono::Datelike;
+    let weekday = date.weekday();
+    let days_from_monday = weekday.num_days_from_monday();
+    let monday = date - chrono::Duration::days(days_from_monday as i64);
+    let sunday = monday + chrono::Duration::days(6);
+    (monday, sunday)
+}
+
+// Quebra um range [from..to] em chunks que cabem cada um numa única semana
+// ISO (Mon-Sun). Necessário pra cada chunk ser sincronizado no parent certo.
+fn split_range_by_week(
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> Vec<(chrono::NaiveDate, chrono::NaiveDate)> {
+    let mut chunks = Vec::new();
+    let mut current = from;
+    while current <= to {
+        let (_mon, sun) = get_week_range(current);
+        let chunk_to = sun.min(to);
+        chunks.push((current, chunk_to));
+        current = chunk_to + chrono::Duration::days(1);
+    }
+    chunks
+}
+
 async fn run_todo_inspect() -> Result<(), String> {
     let (token, list_id) = slack_env()?;
+
+    println!("=== JSON completo do primeiro item (pra ver todos os campos) ===");
+    match lists::fetch_first_item_raw(&token, &list_id).await {
+        Ok(raw) => println!("{}", raw),
+        Err(e) => println!("  (erro: {})", e),
+    }
+    println!();
+
+    println!("=== Colunas disponíveis na lista ===");
+    match lists::fetch_raw_fields(&token, &list_id).await {
+        Ok(fields) => {
+            for (key, tipo) in &fields {
+                println!("  key={:20} type={}", key, tipo);
+            }
+        }
+        Err(e) => println!("  (não foi possível ler colunas: {})", e),
+    }
+    println!();
+
     let items = lists::fetch_items(&token, &list_id).await?;
     println!("=== Lista {} ({} itens) ===\n", list_id, items.len());
 
@@ -408,7 +495,7 @@ async fn run_todo_inspect() -> Result<(), String> {
         println!();
     }
 
-    if let Some(w) = find_current_week_parent(&items) {
+    if let Some(w) = find_current_week_parent(&items, chrono::Local::now().date_naive()) {
         println!(
             "Semana atual detectada: {} (row_id={})",
             w.name.as_deref().unwrap_or("(sem nome)"),
@@ -420,14 +507,195 @@ async fn run_todo_inspect() -> Result<(), String> {
     Ok(())
 }
 
-async fn run_todo_sync(apply: bool) -> Result<(), String> {
+async fn run_todo_consolidate(
+    apply: bool,
+    week_date: chrono::NaiveDate,
+) -> Result<(), String> {
+    let (token, list_id) = slack_env()?;
+    let items = lists::fetch_items(&token, &list_id).await?;
+    let parent = find_current_week_parent(&items, week_date).ok_or_else(|| {
+        format!("nenhum parent encontrado para a semana de {}", week_date)
+    })?;
+    let week_row_id = parent.row_id.clone();
+    let week_name = parent.name.clone().unwrap_or_default();
+
+    let children: Vec<lists::ListItem> = items
+        .iter()
+        .filter(|i| i.parent_id.as_deref() == Some(&week_row_id))
+        .cloned()
+        .collect();
+
+    info!(
+        "semana {}: {} subtarefas existentes",
+        week_name,
+        children.len()
+    );
+
+    const MAX: usize = 50;
+    if children.len() <= MAX {
+        println!(
+            "\nSemana {}: {} itens (≤{}), nada a consolidar.",
+            week_name,
+            children.len(),
+            MAX
+        );
+        return Ok(());
+    }
+
+    let consolidated = analyzer::generate_consolidation_plan(&children, MAX).await?;
+
+    println!(
+        "\nSemana: {}\nModo: {}\n",
+        week_name,
+        if apply { "APLICAR" } else { "DRY RUN" }
+    );
+    println!(
+        "Antes: {} itens | Depois: {} itens",
+        children.len(),
+        consolidated.len()
+    );
+    println!("\n--- Lista consolidada ---");
+    for (i, t) in consolidated.iter().enumerate() {
+        println!("  {:2}. {}", i + 1, t);
+    }
+
+    if !apply {
+        println!("\n(dry run — nada foi enviado ao Slack. Use --apply para efetivar.)");
+        return Ok(());
+    }
+
+    println!("\nDeletando {} itens antigos...", children.len());
+    for c in &children {
+        if let Err(e) = lists::delete_item(&token, &list_id, &c.row_id).await {
+            warn!("falha ao deletar {}: {}", c.row_id, e);
+        }
+    }
+
+    println!("Criando {} itens consolidados...", consolidated.len());
+    let date_iso = week_date.format("%Y-%m-%d").to_string();
+    for texto in &consolidated {
+        match lists::create_subtask(
+            &token,
+            &list_id,
+            &week_row_id,
+            texto,
+            true,
+            Some(&date_iso),
+        )
+        .await
+        {
+            Ok(id) => info!("criado: {} ({})", texto, id),
+            Err(e) => warn!("falha ao criar '{}': {}", texto, e),
+        }
+    }
+    println!("Pronto.");
+    Ok(())
+}
+
+async fn run_todo_add(
+    week: chrono::NaiveDate,
+    date: chrono::NaiveDate,
+    done: bool,
+    apply: bool,
+) -> Result<(), String> {
+    use std::io::BufRead;
+    let (token, list_id) = slack_env()?;
+
+    let raw_items: Vec<String> = std::io::stdin()
+        .lock()
+        .lines()
+        .map_while(Result::ok)
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if raw_items.is_empty() {
+        return Err("nenhum item recebido no stdin (um texto por linha)".to_string());
+    }
+    let terms = analyzer::redact_terms();
+    let items: Vec<String> = raw_items
+        .into_iter()
+        .filter(|t| {
+            let dirty = analyzer::contains_redacted(t, &terms);
+            if dirty {
+                warn!("item descartado por conter termo de SLACK_REDACT_TERMS: {}", t);
+            }
+            !dirty
+        })
+        .collect();
+    if items.is_empty() {
+        return Err("todos os itens do stdin foram filtrados por SLACK_REDACT_TERMS".to_string());
+    }
+
+    let existing = lists::fetch_items(&token, &list_id).await?;
+    let (week_row_id, week_name) = match find_current_week_parent(&existing, week) {
+        Some(w) => (w.row_id.clone(), w.name.clone().unwrap_or_default()),
+        None => {
+            let (s, e) = get_week_range(week);
+            let name = format!("{} - {}", s.format("%d/%m/%Y"), e.format("%d/%m/%Y"));
+            if apply {
+                info!("nenhum pai da semana encontrado. Criando: {}...", name);
+                let id = lists::create_root_item(&token, &list_id, &name).await?;
+                (id, name)
+            } else {
+                info!("(dry run) criaria o pai da semana: {}", name);
+                ("DRY_RUN_ID".to_string(), name)
+            }
+        }
+    };
+
+    println!(
+        "\nSemana: {} ({})\nModo: {}\n",
+        week_name,
+        week_row_id,
+        if apply { "APLICAR" } else { "DRY RUN" }
+    );
+    println!("+ Itens ({}), done={}, data={}:", items.len(), done, date);
+    for it in &items {
+        println!("  + {}", it);
+    }
+
+    if !apply {
+        println!("\n(dry run — nada foi enviado ao Slack. Use --apply para efetivar.)");
+        return Ok(());
+    }
+
+    println!("\nAplicando na Slack List...");
+    let date_iso = date.format("%Y-%m-%d").to_string();
+    for it in &items {
+        match lists::create_subtask(&token, &list_id, &week_row_id, it, done, Some(&date_iso)).await {
+            Ok(id) => info!("criado (data {}): {} (row_id={})", date_iso, it, id),
+            Err(e) => warn!("falha ao criar '{}': {}", it, e),
+        }
+    }
+    println!("Pronto.");
+    Ok(())
+}
+
+async fn run_todo_sync(
+    apply: bool,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+    target_week: chrono::NaiveDate,
+) -> Result<(), String> {
     let (token, list_id) = slack_env()?;
 
     let items = lists::fetch_items(&token, &list_id).await?;
-    let week = find_current_week_parent(&items)
-        .ok_or_else(|| "nenhum pai da semana atual encontrado na lista".to_string())?;
-    let week_row_id = week.row_id.clone();
-    let week_name = week.name.clone().unwrap_or_default();
+    let (week_row_id, week_name) = match find_current_week_parent(&items, target_week) {
+        Some(w) => (w.row_id.clone(), w.name.clone().unwrap_or_default()),
+        None => {
+            let (s, e) = get_week_range(target_week);
+            let name = format!("{} - {}", s.format("%d/%m/%Y"), e.format("%d/%m/%Y"));
+            if apply {
+                info!("nenhum pai da semana atual encontrado. Criando: {}...", name);
+                let id = lists::create_root_item(&token, &list_id, &name).await?;
+                (id, name)
+            } else {
+                info!("(dry run) nenhum pai da semana atual encontrado. Criaria: {}", name);
+                ("DRY_RUN_ID".to_string(), name)
+            }
+        }
+    };
+
     let current_subtasks: Vec<lists::ListItem> = items
         .iter()
         .filter(|i| i.parent_id.as_deref() == Some(&week_row_id))
@@ -441,14 +709,40 @@ async fn run_todo_sync(apply: bool) -> Result<(), String> {
         current_subtasks.len()
     );
 
-    let snapshot = tokio::task::spawn_blocking(|| -> Result<analyzer::ActivitySnapshot, String> {
+    let snapshot = tokio::task::spawn_blocking(move || -> Result<analyzer::ActivitySnapshot, String> {
         let (_p, conn) = open_db()?;
-        Ok(analyzer::collect_activity_today(&conn))
+        Ok(analyzer::collect_activity_in_range(&conn, from, to))
     })
     .await
     .map_err(|e| format!("spawn_blocking falhou: {}", e))??;
 
-    let plan = analyzer::generate_sync_plan(&snapshot, &current_subtasks).await?;
+    // Slack Lists impõem 50 subtarefas/parent. Calcula slots disponíveis ANTES
+    // de chamar o LLM pra ele já gerar dentro do limite (e como salvaguarda
+    // depois, trunca caso ultrapasse).
+    const MAX_SUBTASKS: usize = 50;
+    let available_slots = MAX_SUBTASKS.saturating_sub(current_subtasks.len());
+    let mut plan = analyzer::generate_sync_plan(
+        &snapshot,
+        &current_subtasks,
+        available_slots,
+    )
+    .await?;
+
+    if plan.novos.len() > available_slots {
+        warn!(
+            "limite de {} subtarefas/parent atingido: LLM devolveu {} itens, truncando para {} disponíveis",
+            MAX_SUBTASKS,
+            plan.novos.len(),
+            available_slots
+        );
+        plan.novos.truncate(available_slots);
+    }
+    if available_slots == 0 && !plan.novos.is_empty() {
+        warn!(
+            "parent já tem {} subtarefas (limite Slack); nenhum item novo será criado",
+            current_subtasks.len()
+        );
+    }
 
     let subtasks_by_id: std::collections::HashMap<&str, &lists::ListItem> = current_subtasks
         .iter()
@@ -466,7 +760,7 @@ async fn run_todo_sync(apply: bool) -> Result<(), String> {
         println!("  (nenhum)");
     }
     for n in &plan.novos {
-        println!("  + {}", n);
+        println!("  + [{}] {}", n.data, n.texto);
     }
 
     println!("\n✓ Marcar como feitos ({}):", plan.marcar_feito.len());
@@ -487,20 +781,26 @@ async fn run_todo_sync(apply: bool) -> Result<(), String> {
     }
 
     println!("\nAplicando na Slack List...");
-    let today_iso = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
-    for texto in &plan.novos {
+    let fallback_date = snapshot.today;
+    for item in &plan.novos {
+        // Valida data e clampa ao range [from, to] pra evitar LLM colocar
+        // data fora do período sincronizado.
+        let parsed = chrono::NaiveDate::parse_from_str(&item.data, "%Y-%m-%d")
+            .unwrap_or(fallback_date);
+        let item_date = parsed.max(from).min(to);
+        let date_iso = item_date.format("%Y-%m-%d").to_string();
         match lists::create_subtask(
             &token,
             &list_id,
             &week_row_id,
-            texto,
+            &item.texto,
             true,
-            Some(&today_iso),
+            Some(&date_iso),
         )
         .await
         {
-            Ok(id) => info!("criado (feito + data hoje): {} (row_id={})", texto, id),
-            Err(e) => warn!("falha ao criar '{}': {}", texto, e),
+            Ok(id) => info!("criado (feito, data {}): {} (row_id={})", date_iso, item.texto, id),
+            Err(e) => warn!("falha ao criar '{}': {}", item.texto, e),
         }
     }
     for r in &plan.marcar_feito {
@@ -532,7 +832,7 @@ async fn run_report(send: bool) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() {
-    let _ = dotenvy::dotenv_override();
+    let _ = dotenvy::dotenv();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
@@ -541,7 +841,88 @@ async fn main() {
         CliCommand::Report { send } => run_report(send).await,
         CliCommand::Todo { action } => match action {
             TodoAction::Inspect => run_todo_inspect().await,
-            TodoAction::Sync { apply } => run_todo_sync(apply).await,
+            TodoAction::Add { week, date, done, apply } => {
+                let pd = |s: &str| {
+                    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .map_err(|_| format!("data inválida: {}", s))
+                };
+                match pd(&week) {
+                    Ok(w) => match date.as_deref().map(pd).transpose() {
+                        Ok(d) => run_todo_add(w, d.unwrap_or(w), done, apply).await,
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+            TodoAction::Consolidate { week, apply } => {
+                match chrono::NaiveDate::parse_from_str(&week, "%Y-%m-%d") {
+                    Ok(d) => run_todo_consolidate(apply, d).await,
+                    Err(_) => Err(format!("data inválida em --week: {}", week)),
+                }
+            }
+            TodoAction::Sync { apply, date, from, to, target_week } => {
+                let parse_date = |s: String| {
+                    chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                        .map_err(|_| format!("data inválida: {}", s))
+                };
+                let resolve = || -> Result<(chrono::NaiveDate, chrono::NaiveDate, Option<chrono::NaiveDate>), String> {
+                    let today = chrono::Local::now().date_naive();
+                    if date.is_some() && (from.is_some() || to.is_some()) {
+                        return Err("use --date OU --from/--to, não os dois".to_string());
+                    }
+                    let (f, t) = if let Some(d) = date.clone() {
+                        let p = parse_date(d)?;
+                        (p, p)
+                    } else {
+                        let f = match from.clone() {
+                            None => today,
+                            Some(s) => parse_date(s)?,
+                        };
+                        let t = match to.clone() {
+                            None => today,
+                            Some(s) => parse_date(s)?,
+                        };
+                        if f > t {
+                            return Err(format!("--from {} é depois de --to {}", f, t));
+                        }
+                        (f, t)
+                    };
+                    let tw = match target_week.clone() {
+                        None => None,
+                        Some(s) => Some(parse_date(s)?),
+                    };
+                    Ok((f, t, tw))
+                };
+                match resolve() {
+                    Ok((f, t, Some(tw))) => {
+                        // --target-week explícito: força tudo num só parent (override).
+                        run_todo_sync(apply, f, t, tw).await
+                    }
+                    Ok((f, t, None)) => {
+                        // Sem --target-week: divide por semana pra cada chunk
+                        // ir pro parent certo.
+                        let chunks = split_range_by_week(f, t);
+                        if chunks.len() > 1 {
+                            info!(
+                                "range {} → {} cobre {} semanas, dividindo em chunks",
+                                f, t, chunks.len()
+                            );
+                        }
+                        let mut last_err: Option<String> = None;
+                        for (cf, ct) in chunks {
+                            if let Err(e) = run_todo_sync(apply, cf, ct, ct).await {
+                                last_err = Some(format!("chunk {} → {}: {}", cf, ct, e));
+                                break;
+                            }
+                        }
+                        match last_err {
+                            Some(e) => Err(e),
+                            None => Ok(()),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         },
     };
 
