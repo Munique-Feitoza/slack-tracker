@@ -486,17 +486,25 @@ fn excluded_projects() -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Verdadeiro se o próprio diretório OU qualquer ancestral tem um nome listado
+/// em `SLACK_EXCLUDED_PROJECTS`. Comparação case-insensitive.
+///
+/// Walk dos ancestrais é o que cobre o caso "tudo dentro de uma pasta-mãe é pessoal"
+/// (ex.: `~/Área de trabalho/Munique/foo` é vetado por ter `Munique` como ancestral),
+/// sem precisar listar cada projeto novo individualmente.
 fn is_excluded(dir: &std::path::Path) -> bool {
     let excluded = excluded_projects();
     if excluded.is_empty() {
         return false;
     }
-    let name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    excluded.contains(&name)
+    for ancestor in dir.ancestors() {
+        if let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) {
+            if excluded.contains(&name.to_lowercase()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn minutes_by_window_in_range(
@@ -782,8 +790,22 @@ fn build_todo_payload(
     }
 
     buf.push_str("# Top janelas ativas hoje (sinal do que estava na tela)\n");
-    for (w, m) in snapshot.top_janelas.iter().take(10) {
+    // Filtra janelas que mencionam projetos vetados (`SLACK_EXCLUDED_PROJECTS`).
+    // Os nomes batem case-insensitive como substring no título da janela —
+    // isso evita que o LLM gere subtarefas a partir do título da janela
+    // de projetos pessoais que NÃO foram coletados via build_project_activity.
+    let excluded = excluded_projects();
+    let mut emitted = 0;
+    for (w, m) in snapshot.top_janelas.iter() {
+        if emitted >= 10 {
+            break;
+        }
+        let w_lower = w.to_lowercase();
+        if excluded.iter().any(|x| w_lower.contains(x)) {
+            continue;
+        }
         buf.push_str(&format!("- {} min — {}\n", m, w));
+        emitted += 1;
     }
 
     buf.push_str("\n# Lista atual da semana no Slack (NÃO duplique esses itens)\n");
