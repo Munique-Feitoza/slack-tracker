@@ -766,18 +766,12 @@ fn build_todo_payload(
         } else {
             &p.git_log
         });
-        buf.push_str("\n### git status (estado atual, não commitado)\n");
-        buf.push_str(if p.git_status.trim().is_empty() {
-            "(working tree limpo)"
-        } else {
-            &p.git_status
-        });
-        buf.push_str("\n### git diff --stat (estado atual)\n");
-        buf.push_str(if p.git_diff_stat.trim().is_empty() {
-            "(sem diffs)"
-        } else {
-            &p.git_diff_stat
-        });
+        // NÃO incluímos `git status --short` nem `git diff --stat` aqui — ambos
+        // mostram o estado ATUAL da working tree (sem corte por data). Quando há
+        // mudanças antigas não-commitadas, o LLM as narrava como "feito hoje"
+        // (incidente 2026-06-18: 6 features fabricadas a partir de uncommitted state).
+        // Só passamos o que tem data verificável: git log (date-bounded) e
+        // arquivos_modificados (mtime no range).
         buf.push_str("\n### Arquivos modificados no período (formato: YYYY-MM-DD path)\n");
         if p.arquivos_modificados.is_empty() {
             buf.push_str("(nenhum)\n");
